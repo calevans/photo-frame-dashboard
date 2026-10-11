@@ -1,0 +1,124 @@
+diff --git a/arch/arm/dts/sun8i-a33-sinlinx-sina33.dts b/arch/arm/dts/sun8i-a33-sinlinx-sina33.dts
+index d54a067f..4293626e 100644
+--- a/arch/arm/dts/sun8i-a33-sinlinx-sina33.dts
++++ b/arch/arm/dts/sun8i-a33-sinlinx-sina33.dts
+@@ -144,7 +144,8 @@
+ 	pinctrl-names = "default";
+ 	pinctrl-0 = <&mmc2_8bit_pins>;
+ 	vmmc-supply = <&reg_dcdc1>;
+-	bus-width = <8>;
++	bus-width = <4>;
++	max-frequency = <26000000>;
+ 	non-removable;
+ 	cap-mmc-hw-reset;
+ 	status = "okay";
+diff --git a/arch/arm/include/asm/arch-sunxi/sys_proto.h b/arch/arm/include/asm/arch-sunxi/sys_proto.h
+index 92c7721a..49a46a0e 100644
+--- a/arch/arm/include/asm/arch-sunxi/sys_proto.h
++++ b/arch/arm/include/asm/arch-sunxi/sys_proto.h
+@@ -21,6 +21,7 @@ void sdelay(unsigned long);
+  * @sp:		BROM stack pointer
+  */
+ void return_to_fel(uint32_t lr, uint32_t sp);
++void frame_ckpt(int n);
+ 
+ /* Board / SoC level designware gmac init */
+ #if !defined CONFIG_XPL_BUILD && defined CONFIG_SUN7I_GMAC
+diff --git a/arch/arm/mach-sunxi/board.c b/arch/arm/mach-sunxi/board.c
+index 701899ee..2906b63e 100644
+--- a/arch/arm/mach-sunxi/board.c
++++ b/arch/arm/mach-sunxi/board.c
+@@ -39,6 +39,15 @@ struct fel_stash {
+ 
+ struct fel_stash fel_stash __section(".data");
+ 
++/* Bisection aid: bail back to FEL at checkpoint FRAME_CKPT so a returning FEL proves we got that far. */
++void frame_ckpt(int n)
++{
++#if defined(FRAME_CKPT) && defined(CONFIG_XPL_BUILD)
++	if (n == FRAME_CKPT)
++		return_to_fel(fel_stash.sp, fel_stash.lr);
++#endif
++}
++
+ #ifdef CONFIG_ARM64
+ #include <asm/armv8/mmu.h>
+ 
+@@ -459,6 +468,7 @@ u32 spl_mmc_boot_mode(struct mmc *mmc, const u32 boot_device)
+ 
+ void board_init_f(ulong dummy)
+ {
++	frame_ckpt(1);
+ 	sunxi_sram_init();
+ 
+ 	/* Enable non-secure access to some peripherals */
+@@ -467,6 +477,7 @@ void board_init_f(ulong dummy)
+ 	clock_init();
+ 	timer_init();
+ 	gpio_init();
++	frame_ckpt(2);
+ 
+ 	spl_init();
+ 	preloader_console_init();
+@@ -477,6 +488,7 @@ void board_init_f(ulong dummy)
+ 	i2c_init(CONFIG_SYS_I2C_SPEED, CONFIG_SYS_I2C_SLAVE);
+ #endif
+ 	sunxi_board_init();
++	frame_ckpt(6);
+ }
+ #endif /* CONFIG_XPL_BUILD */
+ 
+diff --git a/arch/arm/mach-sunxi/dram_sun8i_a33.c b/arch/arm/mach-sunxi/dram_sun8i_a33.c
+index 0d08b6a4..bb638d93 100644
+--- a/arch/arm/mach-sunxi/dram_sun8i_a33.c
++++ b/arch/arm/mach-sunxi/dram_sun8i_a33.c
+@@ -280,6 +280,16 @@ static int mctl_channel_init(struct dram_para *para)
+ 			return -EIO;
+ 	}
+ done:
++	/*
++	 * PF1007L frame: byte lane 0 comes out of reset disabled, so the low
++	 * byte reads back as zero. Mirror lane 1's config onto it and retrain.
++	 */
++	if (para->bus_width == 16 && !(readl(DXnGCR0(0)) & 0x1)) {
++		writel(readl(DXnGCR0(1)), DXnGCR0(0));
++		if (mctl_train_dram(para) != 0)
++			return -EIO;
++	}
++
+ 	/* Check the dramc status */
+ 	mctl_await_completion(&mctl_ctl->statr, 0x1, 0x1);
+ 
+diff --git a/board/sunxi/board.c b/board/sunxi/board.c
+index 824c322a..cb1f087e 100644
+--- a/board/sunxi/board.c
++++ b/board/sunxi/board.c
+@@ -624,8 +624,10 @@ void sunxi_board_init(void)
+ 	power_failed |= axp_set_sw(IS_ENABLED(CONFIG_AXP_SW_ON));
+ #endif
+ #endif	/* CONFIG_AXPxxx_POWER */
++	frame_ckpt(4);
+ 	printf("DRAM:");
+ 	gd->ram_size = sunxi_dram_init();
++	frame_ckpt(5);
+ 	printf(" %d MiB\n", (int)(gd->ram_size >> 20));
+ 	if (!gd->ram_size)
+ 		hang();
+diff --git a/drivers/usb/gadget/f_mass_storage.c b/drivers/usb/gadget/f_mass_storage.c
+index ffe1ae6e..287d1035 100644
+--- a/drivers/usb/gadget/f_mass_storage.c
++++ b/drivers/usb/gadget/f_mass_storage.c
+@@ -671,9 +671,10 @@ static int sleep_thread(struct fsg_common *common)
+ 			if (common->eject)
+ 				return -EPIPE;
+ 
+-			/* Handle CTRL+C */
+-			if (ctrlc())
+-				return -EPIPE;
++			/*
++			 * PF1007L frame: the console RX pin floats, and line noise
++			 * decoding as CTRL+C was aborting UMS mid-transfer.
++			 */
+ 
+ 			/* Check cable connection */
+ 			if (!g_dnl_board_usb_cable_connected())
